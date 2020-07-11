@@ -1,0 +1,20 @@
+apiVersion: storage.k8s.io/v1beta1
+kind: CSIDriver
+metadata:
+  name: csi.kunde21.moosefs
+spec:
+  attachRequired: false
+  volumeLifecycleModes:
+  - Persistent
+  podInfoOnMount: true
+
+---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: moosefs-file-storage
+  namespace: kube-system
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: csi.kunde21.moosefs
+...

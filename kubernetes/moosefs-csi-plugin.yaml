@@ -1,0 +1,182 @@
+---
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  name: csi-moosefs-controller
+  namespace: kube-system
+spec:
+  serviceName: "csi-moosefs"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: csi-moosefs-controller
+      role: csi-moosefs
+  template:
+    metadata:
+      labels:
+        app: csi-moosefs-controller
+        role: csi-moosefs
+    spec:
+      priorityClassName: system-cluster-critical
+      serviceAccount: csi-moosefs-plugin-controller
+      containers:
+        # provisioner
+        - name: csi-provisioner
+          image: kunde21/k8s-provisioner:v1.5.0
+          args:
+            - "--provisioner=csi.kunde21.moosefs"
+            - "--csi-address=$(ADDRESS)"
+            - "--v=5"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/      
+        # attacher
+        - name: csi-attacher
+          image: kunde21/k8s-attacher:v2.1.0
+          args:
+            - "--v=5"
+            - "--csi-address=$(ADDRESS)"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+        # TODO: Integrate mfssnapshot functionality
+        # snapshotter
+        # - name: csi-snapshotter
+        #   image: kunde21/csi-snapshotter:v1.0.1
+        #   args:
+        #     - "--connection-timeout=15s"
+        #     - "--csi-address=$(ADDRESS)"
+        #   env:
+        #     - name: ADDRESS
+        #       value: /var/lib/csi/sockets/pluginproxy/csi.sock
+        #   imagePullPolicy: "IfNotPresent"
+        #   volumeMounts:
+        #     - name: socket-dir
+        #       mountPath: /var/lib/csi/sockets/pluginproxy/
+        # Moosefs Plugin
+        - name: moosefs-csi-plugin
+          image: kunde21/moosefs-csi:v0.0.5
+          args :
+            - "controller"
+            - "--node=$(NODE_ID)"
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--server=$(MFS_SERVER)"           
+            - "--root=$(MFS_ROOT_PATH)"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+            - name: MFS_ROOT_PATH
+              value: "/kubernetes/"
+            - name: MFS_SERVER
+              value: "mfsmaster" # IP address of your MooseFS master
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+
+---
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: csi-moosefs-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: csi-moosefs-node
+  template:
+    metadata:
+      labels:
+        app: csi-moosefs-node
+        role: csi-moosefs
+    spec:
+      priorityClassName: system-node-critical
+      serviceAccount: csi-moosefs-plugin-node
+      hostNetwork: true
+      containers:
+        - name: driver-registrar
+          image: kunde21/k8s-node-driver-registrar:v1.3.0
+          imagePullPolicy: "IfNotPresent"
+          args:
+            - "--v=5"
+            - "--csi-address=$(ADDRESS)"
+            - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: DRIVER_REG_SOCK_PATH
+              value: /var/lib/kubelet/plugins/csi.kunde21.moosefs/csi.sock              
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi/
+            - name: registration-dir
+              mountPath: /registration/
+        - name: csi-moosefs-plugin 
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          image: kunde21/moosefs-csi:v0.0.5
+          args :
+            - "node"
+            - "--node=$(NODE_ID)"
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--server=$(MFS_SERVER)"           
+            - "--root=$(MFS_ROOT_PATH)"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: MFS_ROOT_PATH
+              value: "/kubernetes/"
+            - name: MFS_SERVER
+              value: "mfsmaster" # IP address of your MooseFS master
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: "Bidirectional"
+            - mountPath: /dev
+              name: device-dir
+      volumes:
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: DirectoryOrCreate
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/csi.kunde21.moosefs
+            type: DirectoryOrCreate
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: device-dir
+          hostPath:
+            path: /dev
+...

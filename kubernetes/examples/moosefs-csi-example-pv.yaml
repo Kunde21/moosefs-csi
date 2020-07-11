@@ -1,0 +1,19 @@
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: moosefs-csi-pv
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: moosefs-file-storage
+  volumeMode: Filesystem
+  capacity:
+    storage: 1Gi
+  storageClassName: moosefs-file-storage
+  csi:
+    driver: csi.kunde21.moosefs
+    volumeAttributes:
+      path: 'testpath'
+    volumeHandle: moosefs-csi-pv
+...

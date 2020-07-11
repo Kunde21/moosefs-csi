@@ -1,0 +1,31 @@
+---
+kind: Pod
+apiVersion: v1
+metadata:
+  name: moosfs-example-mount
+spec:
+  containers:
+    - name: busybox
+      image: busybox
+      volumeMounts:
+      - mountPath: "/data"
+        name: moosefs-volume
+      command: [ "sleep", "1000000" ]
+  volumes:
+    - name: moosefs-volume
+      persistentVolumeClaim:
+        claimName: dynamic-claim
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dynamic-claim
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: moosefs-file-storage
+  resources:
+    requests:
+      storage: 1Gi
+...

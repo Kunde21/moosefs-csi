@@ -1,0 +1,13 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: moosefs-csi-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi # TODO(quotas): this value does not have any effect, yet
+  storageClassName: moosefs-file-storage
+...
