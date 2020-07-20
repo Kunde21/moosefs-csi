@@ -18,7 +18,7 @@ type mfsDriver struct {
 
 const driverName = "csi.kunde21.moosefs"
 
-var version = "0.0.1"
+var version = "0.0.2"
 
 func NewMFSdriver(nodeID, endpoint, mfsServer string) *mfsDriver {
 	vcam := []csi.VolumeCapability_AccessMode_Mode{

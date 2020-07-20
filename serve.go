@@ -15,7 +15,7 @@ type Registrar interface {
 	Register(*grpc.Server)
 }
 
-func Serve(endpoint string, services ...Registrar) error {
+func Serve(ctx context.Context, endpoint string, services ...Registrar) error {
 	var proto, addr string
 	if strings.HasPrefix(strings.ToLower(endpoint), "unix://") ||
 		strings.HasPrefix(strings.ToLower(endpoint), "tcp://") {
@@ -42,6 +42,10 @@ func Serve(endpoint string, services ...Registrar) error {
 	for _, svc := range services {
 		svc.Register(server)
 	}
+	go func() {
+		<-ctx.Done()
+		server.GracefulStop()
+	}()
 	return server.Serve(listener)
 }
 

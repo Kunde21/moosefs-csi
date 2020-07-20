@@ -1,6 +1,6 @@
 ---
-kind: StatefulSet
 apiVersion: apps/v1
+kind: StatefulSet
 metadata:
   name: csi-moosefs-controller
   namespace: kube-system
@@ -87,13 +87,16 @@ spec:
             - name: CSI_ENDPOINT
               value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
             - name: MFS_ROOT_MOUNT_PATH
-              value: /var/lib/mfs/kubernetes
+              value: /opt/mfs/kubernetes
           imagePullPolicy: "IfNotPresent"
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
             - name: pods-mount-dir
               mountPath: /var/lib/mfs/kubernetes
+              mountPropagation: "Bidirectional"
+            - name: controller-mount-dir
+              mountPath: /opt/mfs/kubernetes
               mountPropagation: "Bidirectional"
       volumes:
         - name: socket-dir
@@ -102,10 +105,14 @@ spec:
           hostPath:
             path: /var/lib/mfs/kubernetes
             type: DirectoryOrCreate
+        - name: controller-mount-dir
+          hostPath:
+            path: /opt/mfs/kubernetes
+            type: DirectoryOrCreate
 
 ---
-kind: DaemonSet
 apiVersion: apps/v1
+kind: DaemonSet
 metadata:
   name: csi-moosefs-node
   namespace: kube-system

@@ -1,6 +1,6 @@
 ARG MOOSEFS_IMAGE
 ARG MOOSEFS_TAG
-FROM golang:1.14-alpine3.12 AS build-env
+FROM golang:1.15-alpine3.12 AS build-env
 
 ARG MOOSEFS_VERSION=development
 ARG GOPROXY=https://proxy.golang.org
@@ -11,7 +11,7 @@ WORKDIR /build
 
 COPY . .
 
-RUN go build -trimpath -v -o /moosefs-csi-plugin -a -ldflags "-s -w -X 'main.version=$MOOSEFS_VERSION' --extldflags '-static'" ./moosefs-csi
+RUN go build -trimpath -v -o /moosefs-csi-plugin -a -ldflags "-s -w -X 'mfs.version=$MOOSEFS_VERSION' --extldflags '-static'" ./moosefs-csi
 
 FROM ${MOOSEFS_IMAGE}:${MOOSEFS_TAG}
 LABEL container_build="Chad Kunde <Kunde21@gmail.com>"
