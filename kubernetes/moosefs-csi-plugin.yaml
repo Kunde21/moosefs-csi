@@ -63,6 +63,11 @@ spec:
         #       mountPath: /var/lib/csi/sockets/pluginproxy/
         # Moosefs Plugin
         - name: moosefs-csi-plugin
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
           image: kunde21/moosefs-csi:v0.0.5
           args :
             - "controller"
@@ -70,6 +75,10 @@ spec:
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--server=$(MFS_SERVER)"           
             - "--root=$(MFS_ROOT_PATH)"
+            - "--mount=$(MFS_ROOT_MOUNT_PATH)"
+          envFrom:
+            - configMapRef:
+                name: csi-moosefs-config
           env:
             - name: NODE_ID
               valueFrom:
@@ -77,17 +86,22 @@ spec:
                   fieldPath: spec.nodeName
             - name: CSI_ENDPOINT
               value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
-            - name: MFS_ROOT_PATH
-              value: "/kubernetes/"
-            - name: MFS_SERVER
-              value: "mfsmaster" # IP address of your MooseFS master
+            - name: MFS_ROOT_MOUNT_PATH
+              value: /var/lib/mfs/kubernetes
           imagePullPolicy: "IfNotPresent"
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
+            - name: pods-mount-dir
+              mountPath: /var/lib/mfs/kubernetes
+              mountPropagation: "Bidirectional"
       volumes:
         - name: socket-dir
           emptyDir: {}
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/mfs/kubernetes
+            type: DirectoryOrCreate
 
 ---
 kind: DaemonSet
@@ -143,6 +157,9 @@ spec:
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--server=$(MFS_SERVER)"           
             - "--root=$(MFS_ROOT_PATH)"
+          envFrom:
+            - configMapRef:
+                name: csi-moosefs-config
           env:
             - name: NODE_ID
               valueFrom:
@@ -150,10 +167,6 @@ spec:
                   fieldPath: spec.nodeName
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
-            - name: MFS_ROOT_PATH
-              value: "/kubernetes/"
-            - name: MFS_SERVER
-              value: "mfsmaster" # IP address of your MooseFS master
           imagePullPolicy: "IfNotPresent"
           volumeMounts:
             - name: plugin-dir

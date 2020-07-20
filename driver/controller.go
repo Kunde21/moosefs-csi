@@ -2,8 +2,11 @@ package mfs
 
 import (
 	"context"
+	"fmt"
+	"path"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"k8s.io/utils/mount"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -13,11 +16,28 @@ import (
 var _ csi.ControllerServer = (*ControllerServer)(nil)
 
 type ControllerServer struct {
-	d *mfsDriver
+	d    *mfsDriver
+	root string
 }
 
-func NewControllerServer(d *mfsDriver) *ControllerServer {
-	return &ControllerServer{d: d}
+func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer, error) {
+	root, mountDir = path.Clean(root), path.Clean(mountDir)
+	if root == "" {
+		root = "/"
+	}
+	switch mountDir {
+	case "", "/":
+		return nil, fmt.Errorf("invalid mount directory %v", mountDir)
+	}
+	m := mount.New("")
+
+	if err := m.Mount(path.Join(d.mfsServer+":", root), mountDir, "moosefs", nil); err != nil {
+		return nil, fmt.Errorf("failed to mount root directory: %w", err)
+	}
+	return &ControllerServer{
+		d:    d,
+		root: root,
+	}, nil
 }
 
 // Register node server to the grpc server

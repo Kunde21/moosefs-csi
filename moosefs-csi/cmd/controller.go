@@ -41,14 +41,19 @@ to quickly create a Cobra application.`,
 	RunE: RunController,
 }
 
-var root string
-
-func init() { rootCmd.AddCommand(controllerCmd) }
+func init() {
+	rootCmd.AddCommand(controllerCmd)
+	controllerCmd.Flags().StringVarP(&csiArgs.mountDir, "mount", "m", "/opt/mfs/kubernetes",
+		"mount point for controller directory.")
+}
 
 // RunController runs the controller server
 func RunController(cmd *cobra.Command, args []string) error {
 	driver := mfs.NewMFSdriver(csiArgs.nodeID, csiArgs.endpoint, csiArgs.server)
-	cs := mfs.NewControllerServer(driver)
+	cs, err := mfs.NewControllerServer(driver, csiArgs.root, csiArgs.mountDir)
+	if err != nil {
+		return err
+	}
 	is, err := mfs.NewIdentityServer(driver)
 	if err != nil {
 		return err
