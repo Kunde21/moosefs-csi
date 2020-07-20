@@ -27,7 +27,7 @@ import (
 var (
 	cfgFile string
 	csiArgs struct {
-		endpoint, server, nodeID, root string
+		endpoint, server, nodeID, root, mountDir string
 	}
 )
 
