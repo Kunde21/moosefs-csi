@@ -2,12 +2,23 @@ package mfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
+	"os"
 	"path"
 	"path/filepath"
+	"time"
 
-	"github.com/Kunde21/moosefs-csi/driver/store/bolt"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	v1 "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/mount"
 
 	"google.golang.org/grpc"
@@ -15,15 +26,25 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const boltFile = "csi.kunde21.moosefs.bdb"
+// Keys set within the volume context to hold volume details
+const (
+	// Server Key
+	sk = "server"
+	// Path Key
+	pk = "path"
+	// Root Key
+	rk = "root"
+)
 
 var _ csi.ControllerServer = (*ControllerServer)(nil)
 
 type ControllerServer struct {
 	d        *mfsDriver
-	vol      *bolt.VolStore
 	mountDir string
 	root     string
+
+	stop chan struct{}
+	vols v1.PersistentVolumeInformer
 }
 
 func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer, error) {
@@ -32,23 +53,49 @@ func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer
 		root = "/"
 	}
 	switch mountDir {
-	case "", "/":
+	case "", ".", "/":
 		return nil, fmt.Errorf("invalid mount directory %v", mountDir)
 	}
+	// Multiple clusters on the same nodes could cause a collision where clusters are sharing
+	// the same default mountDir.  Avoid collisions unless they are the same mfs root directory.
+	mountDir = filepath.Join(mountDir, root)
+
 	m := mount.New("")
+	if err := m.Unmount(mountDir); err != nil {
+		log.Printf("cleanup error: %v", err)
+	}
+	if err := os.MkdirAll(mountDir, 0744); err != nil {
+		return nil, err
+	}
 
 	if err := m.Mount(path.Join(d.mfsServer+":", root), mountDir, "moosefs", nil); err != nil {
 		return nil, fmt.Errorf("failed to mount root directory: %w", err)
 	}
-	vs, err := bolt.New(filepath.Join(mountDir, boltFile))
+
+	conf, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, err
 	}
+	k8cl, err := kubernetes.NewForConfig(conf)
+	if err != nil {
+		return nil, err
+	}
+	pv, err := k8cl.CoreV1().PersistentVolumes().Get("postgres-pv", metav1.GetOptions{})
+	if err != nil {
+		log.Println(err)
+	}
+	log.Println(pv)
+	core := informers.NewSharedInformerFactory(k8cl, 30*time.Second)
+	vols := core.Core().V1().PersistentVolumes()
+	stop := make(chan struct{}, 1)
+	go vols.Informer().Run(stop)
 	return &ControllerServer{
 		d:        d,
-		vol:      vs,
 		mountDir: mountDir,
 		root:     root,
+
+		stop: stop,
+		vols: vols,
 	}, nil
 }
 
@@ -59,10 +106,9 @@ func (cs *ControllerServer) Register(srv *grpc.Server) {
 
 // Close the server and release resources.
 func (cs *ControllerServer) Close() error {
-	verr := cs.vol.Close()
-	merr := mount.New("").Unmount(cs.mountDir)
-	if verr != nil || merr != nil {
-		return fmt.Errorf("errors encountered store %q mount %q", verr, merr)
+	err := mount.New("").Unmount(cs.mountDir)
+	if err != nil {
+		return fmt.Errorf("errors encountered mount %q", err)
 	}
 	return nil
 }
@@ -74,23 +120,47 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	case len(req.GetVolumeCapabilities()) == 0:
 		return nil, status.Error(codes.InvalidArgument, "capabilities not provided")
 	}
-	if err := cs.vol.InsertVolume(ctx, bolt.Volume{
-		ID:       req.GetName(),
-		Capacity: req.CapacityRange.GetRequiredBytes(),
-		Params:   req.GetParameters(),
-	}); err != nil {
-		if status.Code(err) == codes.AlreadyExists {
-			return nil, err
+	prms, vCtx := req.GetParameters(), map[string]string{}
+	vCtx[sk] = cs.d.mfsServer
+	if prms[sk] != "" {
+		vCtx[sk] = prms[sk]
+	}
+	// clear out any relative paths to protect cluster root
+	vCtx[pk] = filepath.Join("volumes", req.GetName())
+	vCtx[rk] = cs.root
+	if cp := path.Clean(prms[pk]); cp != "." {
+		if !path.IsAbs(cp) {
+			// relative paths can escape into the host filesystem
+			// join them to root to force an absolute path starting in mfs root directory
+			cp = path.Join("/", cp)
 		}
-		return nil, status.Error(codes.Internal, err.Error())
+		if prms[rk] == "true" {
+			vCtx[rk] = ""
+		}
+		vCtx[pk] = cp
 	}
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
-			VolumeId:      req.Name,
-			VolumeContext: req.GetParameters(),
+			VolumeId:      req.GetName(),
+			CapacityBytes: req.CapacityRange.GetRequiredBytes(),
+			VolumeContext: vCtx,
 		},
 	}, nil
+}
+
+func dirExist(mount, path string) (bool, error) {
+	dirPath := filepath.Join(mount, path)
+	fi, err := os.Stat(dirPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, status.Errorf(codes.Internal, "file system error: %v", err)
+	}
+	if fi.IsDir() {
+		return true, nil
+	}
+	return true, status.Errorf(codes.FailedPrecondition, "path %q is not a directory", path)
 }
 
 func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
@@ -98,8 +168,19 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	case req.GetVolumeId():
 		return nil, status.Error(codes.InvalidArgument, "volume id not provided")
 	}
-	if err := cs.vol.DeleteVolume(ctx, req.GetVolumeId()); err != nil {
+	vk8, err := cs.vols.Lister().Get(req.GetVolumeId())
+	if err != nil {
+		if k8serr.IsNotFound(err) {
+			return &csi.DeleteVolumeResponse{}, nil
+		}
 		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if vk8.Spec.CSI == nil || vk8.Spec.CSI.VolumeAttributes == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume not provisioned by CSI driver")
+	}
+	params := vk8.Spec.CSI.VolumeAttributes
+	if err := os.RemoveAll(filepath.Join(cs.mountDir, params[pk])); err != nil {
+		return nil, status.Errorf(codes.Internal, "remove directory failed: %v", err)
 	}
 	return &csi.DeleteVolumeResponse{}, nil
 }
@@ -108,12 +189,52 @@ func (cs *ControllerServer) ControllerGetVolume(_ context.Context, _ *csi.Contro
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, _ *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	log.Printf("publish request %+v", req)
+	switch "" {
+	case req.GetNodeId(), req.GetVolumeId():
+		return nil, status.Error(codes.InvalidArgument, "node and volume ids are required")
+	}
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability required")
+	}
+	vk8, err := cs.vols.Lister().Get(req.GetVolumeId())
+	if err != nil {
+		log.Println(err)
+		return nil, status.Error(codes.NotFound, "volume does not exist")
+	}
+	c := vk8.Spec.Capacity[corev1.ResourceStorage]
+	_, ok := c.AsInt64()
+	if !ok {
+		return nil, status.Error(codes.Internal, "failed to get capacity")
+	}
+	vCtx := req.GetVolumeContext()
+	if vCtx[rk] == "" {
+		return &csi.ControllerPublishVolumeResponse{}, nil
+	}
+	// Create directory if it does not exist.
+	// Missing directory will cause the mount to fail on the node.
+	ex, err := dirExist(cs.mountDir, vCtx[pk])
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("mountdir: %q, path: %q", cs.mountDir, vCtx[pk])
+	md := filepath.Join(cs.mountDir, vCtx[pk])
+	if !ex {
+		log.Printf("dirpath: %q", md)
+		if err := os.MkdirAll(md, 0755); err != nil {
+			return nil, status.Errorf(codes.Internal, "create directory failed: %v", err)
+		}
+	}
+	return &csi.ControllerPublishVolumeResponse{}, nil
 }
 
-func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, _ *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	switch "" {
+	case req.GetVolumeId():
+		return nil, status.Error(codes.InvalidArgument, "missing volume id")
+	}
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
 func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
@@ -121,7 +242,7 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 	case req.GetVolumeId():
 		return nil, status.Error(codes.InvalidArgument, "invalid request")
 	}
-	_, err := cs.vol.GetVolume(ctx, req.GetVolumeId())
+	_, err := cs.vols.Lister().Get(req.GetVolumeId())
 	if status.Code(err) == codes.NotFound {
 		return nil, err
 	}
@@ -164,6 +285,11 @@ func (cs *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *
 			{Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+				},
+			}},
+			{Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 				},
 			}},
 		},

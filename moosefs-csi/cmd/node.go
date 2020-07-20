@@ -22,7 +22,13 @@ THE SOFTWARE.
 package cmd
 
 import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 
 	mfscsi "github.com/Kunde21/moosefs-csi"
 	mfs "github.com/Kunde21/moosefs-csi/driver"
@@ -52,5 +58,22 @@ func RunNode(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return mfscsi.Serve(csiArgs.endpoint, ns, is)
+	ctx, canc := context.WithCancel(context.Background())
+	eg, ctx := errgroup.WithContext(ctx)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	eg.Go(func() error {
+		select {
+		case s := <-sig:
+			log.Printf("signal received %v", s)
+		case <-ctx.Done():
+			log.Println("exiting")
+		}
+		canc()
+		return nil
+	})
+	eg.Go(func() error {
+		return mfscsi.Serve(ctx, csiArgs.endpoint, ns, is)
+	})
+	return eg.Wait()
 }

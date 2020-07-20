@@ -3,7 +3,7 @@ kind: CSIDriver
 metadata:
   name: csi.kunde21.moosefs
 spec:
-  attachRequired: false
+  attachRequired: true
   volumeLifecycleModes:
   - Persistent
   podInfoOnMount: true
