@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
@@ -20,9 +21,9 @@ import (
 )
 
 type NodeServer struct {
-	Driver  *mfsDriver
-	mounter mount.Interface
-	root    string
+	Driver *mfsDriver
+	mnt    mount.Interface
+	root   string
 }
 
 func NewNodeServer(n *mfsDriver, mounter mount.Interface, root string) *NodeServer {
@@ -30,9 +31,9 @@ func NewNodeServer(n *mfsDriver, mounter mount.Interface, root string) *NodeServ
 		root = "/"
 	}
 	return &NodeServer{
-		Driver:  n,
-		mounter: mounter,
-		root:    root,
+		Driver: n,
+		mnt:    mounter,
+		root:   root,
 	}
 }
 
@@ -53,7 +54,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	fmt.Println("volume capabilitiy:", req.GetVolumeCapability().GetAccessMode().String())
 
 	tgt := req.GetTargetPath()
-	notMnt, err := ns.mounter.IsLikelyNotMountPoint(tgt)
+	notMnt, err := ns.mnt.IsLikelyNotMountPoint(tgt)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if err := os.MkdirAll(tgt, 0750); err != nil {
@@ -85,7 +86,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		mo = append(mo, "ro")
 	}
 	log.Println("mounting:", src, ns.Driver.mfsServer, tgt)
-	switch err = ns.mounter.Mount(src, tgt, "moosefs", mo); {
+	switch err = ns.mnt.Mount(src, tgt, "moosefs", mo); {
 	case err == nil:
 		// success
 	case os.IsPermission(err):
@@ -95,7 +96,6 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	default:
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -107,7 +107,7 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		return nil, status.Error(codes.InvalidArgument, "target path not provided")
 	}
 
-	if notMnt, err := ns.mounter.IsLikelyNotMountPoint(req.GetTargetPath()); err != nil {
+	if notMnt, err := ns.mnt.IsLikelyNotMountPoint(req.GetTargetPath()); err != nil {
 		switch {
 		case os.IsNotExist(err):
 			return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -120,11 +120,16 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	} else if notMnt {
 		return nil, status.Error(codes.NotFound, "volume not mounted")
 	}
-
-	if err := mount.CleanupMountPoint(req.GetTargetPath(), ns.mounter, false); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	backoff := 2 * time.Millisecond
+	var err error
+	for i := 0; i < 3; i++ {
+		if err = mount.CleanupMountPoint(req.GetTargetPath(), ns.mnt, false); err == nil {
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
+		// mountpoint is likely busy, backoff and re-attempt
+		time.Sleep(backoff * (time.Duration(i*i) + 1))
 	}
-	return &csi.NodeUnpublishVolumeResponse{}, nil
+	return nil, status.Error(codes.Internal, err.Error())
 }
 
 func (ns *NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {

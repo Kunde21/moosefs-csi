@@ -9,6 +9,7 @@ require (
 	github.com/sirupsen/logrus v1.4.2
 	github.com/spf13/cobra v1.0.0
 	github.com/spf13/viper v1.4.0
+	go.etcd.io/bbolt v1.3.2
 	golang.org/x/net v0.0.0-20200625001655-4c5254603344 // indirect
 	google.golang.org/grpc v1.30.0
 	k8s.io/utils v0.0.0-20200619165400-6e3d28b6ed19

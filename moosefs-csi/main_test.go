@@ -13,6 +13,8 @@ import (
 
 func TestSanity(t *testing.T) {
 	const testdir = "/tmp/csitesting"
+	const root = "/csitest"
+	const conDir = "/tmp/controller"
 	mfsEP := os.Getenv("MOOSEFS_ENDPOINT")
 	if mfsEP == "" {
 		t.Skipf("missing %q environment variable, skipping csi-sanity test", "MOOSEFS_ENDPOINT")
@@ -41,8 +43,11 @@ func TestSanity(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	ns := mfs.NewNodeServer(driver, m, "/testing/")
-	cs := mfs.NewControllerServer(driver)
+	ns := mfs.NewNodeServer(driver, m, root)
+	cs, err := mfs.NewControllerServer(driver, root, conDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ids, err := mfs.NewIdentityServer(driver)
 	if err != nil {
 		t.Fatal(err)
@@ -52,6 +57,7 @@ func TestSanity(t *testing.T) {
 			t.Log(err)
 		}
 	}()
+	t.Cleanup(func() { cs.Close() })
 
 	conf := sanity.NewTestConfig()
 	conf.Address = ep

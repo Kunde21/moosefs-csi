@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"path/filepath"
 
+	"github.com/Kunde21/moosefs-csi/driver/store/bolt"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"k8s.io/utils/mount"
 
@@ -13,11 +15,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const boltFile = "csi.kunde21.moosefs.bdb"
+
 var _ csi.ControllerServer = (*ControllerServer)(nil)
 
 type ControllerServer struct {
-	d    *mfsDriver
-	root string
+	d        *mfsDriver
+	vol      *bolt.VolStore
+	mountDir string
+	root     string
 }
 
 func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer, error) {
@@ -34,9 +40,15 @@ func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer
 	if err := m.Mount(path.Join(d.mfsServer+":", root), mountDir, "moosefs", nil); err != nil {
 		return nil, fmt.Errorf("failed to mount root directory: %w", err)
 	}
+	vs, err := bolt.New(filepath.Join(mountDir, boltFile))
+	if err != nil {
+		return nil, err
+	}
 	return &ControllerServer{
-		d:    d,
-		root: root,
+		d:        d,
+		vol:      vs,
+		mountDir: mountDir,
+		root:     root,
 	}, nil
 }
 
@@ -45,12 +57,32 @@ func (cs *ControllerServer) Register(srv *grpc.Server) {
 	csi.RegisterControllerServer(srv, cs)
 }
 
+// Close the server and release resources.
+func (cs *ControllerServer) Close() error {
+	verr := cs.vol.Close()
+	merr := mount.New("").Unmount(cs.mountDir)
+	if verr != nil || merr != nil {
+		return fmt.Errorf("errors encountered store %q mount %q", verr, merr)
+	}
+	return nil
+}
+
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	switch {
 	case req.GetName() == "":
 		return nil, status.Error(codes.InvalidArgument, "name not provided")
 	case len(req.GetVolumeCapabilities()) == 0:
 		return nil, status.Error(codes.InvalidArgument, "capabilities not provided")
+	}
+	if err := cs.vol.InsertVolume(ctx, bolt.Volume{
+		ID:       req.GetName(),
+		Capacity: req.CapacityRange.GetRequiredBytes(),
+		Params:   req.GetParameters(),
+	}); err != nil {
+		if status.Code(err) == codes.AlreadyExists {
+			return nil, err
+		}
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -65,6 +97,9 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	switch "" {
 	case req.GetVolumeId():
 		return nil, status.Error(codes.InvalidArgument, "volume id not provided")
+	}
+	if err := cs.vol.DeleteVolume(ctx, req.GetVolumeId()); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &csi.DeleteVolumeResponse{}, nil
 }
@@ -85,6 +120,13 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 	switch "" {
 	case req.GetVolumeId():
 		return nil, status.Error(codes.InvalidArgument, "invalid request")
+	}
+	_, err := cs.vol.GetVolume(ctx, req.GetVolumeId())
+	if status.Code(err) == codes.NotFound {
+		return nil, err
+	}
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 	switch 0 {
 	case len(req.GetVolumeCapabilities()):
