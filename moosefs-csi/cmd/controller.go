@@ -22,6 +22,8 @@ THE SOFTWARE.
 package cmd
 
 import (
+	"log"
+
 	"github.com/spf13/cobra"
 
 	mfscsi "github.com/Kunde21/moosefs-csi"
@@ -50,13 +52,18 @@ func init() {
 // RunController runs the controller server
 func RunController(cmd *cobra.Command, args []string) error {
 	driver := mfs.NewMFSdriver(csiArgs.nodeID, csiArgs.endpoint, csiArgs.server)
-	cs, err := mfs.NewControllerServer(driver, csiArgs.root, csiArgs.mountDir)
-	if err != nil {
-		return err
-	}
 	is, err := mfs.NewIdentityServer(driver)
 	if err != nil {
 		return err
 	}
+	cs, err := mfs.NewControllerServer(driver, csiArgs.root, csiArgs.mountDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := cs.Close(); err != nil {
+			log.Println(err)
+		}
+	}()
 	return mfscsi.Serve(csiArgs.endpoint, cs, is)
 }
