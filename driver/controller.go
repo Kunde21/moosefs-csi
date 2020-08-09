@@ -2,7 +2,10 @@ package mfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
+	"os"
 	"path"
 	"path/filepath"
 
@@ -16,6 +19,16 @@ import (
 )
 
 const boltFile = "csi.kunde21.moosefs.bdb"
+
+// Keys set within the volume context to hold volume details
+const (
+	// Server Key
+	sk = "server"
+	// Path Key
+	pk = "path"
+	// Root Key
+	rk = "root"
+)
 
 var _ csi.ControllerServer = (*ControllerServer)(nil)
 
@@ -32,7 +45,7 @@ func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer
 		root = "/"
 	}
 	switch mountDir {
-	case "", "/":
+	case "", ".", "/":
 		return nil, fmt.Errorf("invalid mount directory %v", mountDir)
 	}
 	m := mount.New("")
@@ -74,11 +87,31 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	case len(req.GetVolumeCapabilities()) == 0:
 		return nil, status.Error(codes.InvalidArgument, "capabilities not provided")
 	}
-	if err := cs.vol.InsertVolume(ctx, bolt.Volume{
+	prms, vCtx := req.GetParameters(), map[string]string{}
+	vCtx[sk] = cs.d.mfsServer
+	if prms[sk] != "" {
+		vCtx[sk] = prms[sk]
+	}
+	// clear out any relative paths to protect cluster root
+	vCtx[pk] = filepath.Join("volumes", req.GetName())
+	vCtx[rk] = cs.root
+	if cp := path.Clean(prms[pk]); cp != "." {
+		if !path.IsAbs(cp) {
+			// relative paths can escape into the host filesystem
+			// join them to root to force an absolute path starting in mfs root directory
+			cp = path.Join("/", cp)
+		}
+		if prms[rk] == "true" {
+			vCtx[rk] = ""
+		}
+		vCtx[pk] = cp
+	}
+	vol := bolt.Volume{
 		ID:       req.GetName(),
 		Capacity: req.CapacityRange.GetRequiredBytes(),
-		Params:   req.GetParameters(),
-	}); err != nil {
+		Params:   vCtx,
+	}
+	if err := cs.vol.InsertVolume(ctx, vol); err != nil {
 		if status.Code(err) == codes.AlreadyExists {
 			return nil, err
 		}
@@ -86,17 +119,42 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
-			VolumeId:      req.Name,
-			VolumeContext: req.GetParameters(),
+			CapacityBytes: vol.Capacity,
+			VolumeId:      vol.ID,
+			VolumeContext: vol.Params,
 		},
 	}, nil
+}
+
+func dirExist(mount, path string) (bool, error) {
+	dirPath := filepath.Join(mount, path)
+	fi, err := os.Stat(dirPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, status.Errorf(codes.Internal, "file system error: %v", err)
+	}
+	if fi.IsDir() {
+		return true, nil
+	}
+	return true, status.Errorf(codes.FailedPrecondition, "path %q is not a directory", path)
 }
 
 func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	switch "" {
 	case req.GetVolumeId():
 		return nil, status.Error(codes.InvalidArgument, "volume id not provided")
+	}
+	v, err := cs.vol.GetVolume(ctx, req.GetVolumeId())
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return &csi.DeleteVolumeResponse{}, nil
+		}
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if err := os.RemoveAll(filepath.Join(cs.mountDir, v.Params[pk])); err != nil {
+		return nil, status.Errorf(codes.Internal, "remove directory failed: %v", err)
 	}
 	if err := cs.vol.DeleteVolume(ctx, req.GetVolumeId()); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
@@ -108,12 +166,48 @@ func (cs *ControllerServer) ControllerGetVolume(_ context.Context, _ *csi.Contro
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, _ *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	switch "" {
+	case req.GetNodeId(), req.GetVolumeId():
+		return nil, status.Error(codes.InvalidArgument, "node and volume ids are required")
+	}
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability required")
+	}
+	v, err := cs.vol.GetVolume(ctx, req.GetVolumeId())
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, status.Error(codes.NotFound, "volume does not exist")
+		}
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	vCtx := v.Params
+	if vCtx[rk] == "" {
+		return &csi.ControllerPublishVolumeResponse{}, nil
+	}
+	// Create directory if it does not exist.
+	// Missing directory will cause the mount to fail on the node.
+	ex, err := dirExist(cs.mountDir, vCtx[pk])
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("mountdir: %q, path: %q", cs.mountDir, vCtx[pk])
+	md := filepath.Join(cs.mountDir, vCtx[pk])
+	if !ex {
+		log.Printf("dirpath: %q", md)
+		if err := os.MkdirAll(md, 0755); err != nil {
+			return nil, status.Errorf(codes.Internal, "create directory failed: %v", err)
+		}
+	}
+	return &csi.ControllerPublishVolumeResponse{}, nil
 }
 
-func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, _ *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	switch "" {
+	case req.GetVolumeId():
+		return nil, status.Error(codes.InvalidArgument, "missing volume id")
+	}
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
 func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
@@ -164,6 +258,11 @@ func (cs *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *
 			{Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+				},
+			}},
+			{Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 				},
 			}},
 		},

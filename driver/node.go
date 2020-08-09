@@ -69,16 +69,19 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
-	volCtx := req.GetVolumeContext()
-	srv := volCtx["server"]
+	vCtx := req.GetVolumeContext()
+	srv := vCtx[sk]
 	if srv == "" {
 		srv = ns.Driver.mfsServer
 	}
-	srvPath := volCtx["path"]
+	srvPath := vCtx[pk]
 	if srvPath == "" {
 		srvPath = "/"
 	}
-	srvPath = filepath.Join(ns.root, srvPath)
+	srvPath = filepath.Join(vCtx[rk], vCtx[pk])
+	if !filepath.IsAbs(srvPath) {
+		return nil, status.Errorf(codes.InvalidArgument, "volume path must be absolute %q", srvPath)
+	}
 
 	src := fmt.Sprintf("%s:%s", srv, srvPath)
 	mo := req.GetVolumeCapability().GetMount().GetMountFlags()
