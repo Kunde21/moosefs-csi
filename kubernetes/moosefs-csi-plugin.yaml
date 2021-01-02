@@ -48,6 +48,21 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         # TODO: Integrate mfssnapshot functionality
+        # resizer
+        - name: csi-resizer
+          image: kunde21/k8s-resizer:v1.0.1
+          args:
+            - "--connection-timeout=15s"
+            - "--csi-address=$(ADDRESS)"
+            - "--handle-volume-inuse-error=false"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+        # TODO: Integrate mfssnapshot functionality
         # snapshotter
         # - name: csi-snapshotter
         #   image: kunde21/csi-snapshotter:v1.0.1
@@ -199,4 +214,5 @@ spec:
         - name: device-dir
           hostPath:
             path: /dev
+
 ...

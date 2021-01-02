@@ -1,6 +1,7 @@
 package mfs
 
 import (
+	"github.com/Kunde21/moosefs-csi/driver/mfsexec"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 )
 
@@ -11,6 +12,8 @@ type mfsDriver struct {
 	endpoint  string
 	mfsServer string
 
+	moosefsCLI
+
 	nodeID string
 
 	volcap map[csi.VolumeCapability_AccessMode_Mode]bool
@@ -20,7 +23,7 @@ const driverName = "csi.kunde21.moosefs"
 
 var version = "0.0.2"
 
-func NewMFSdriver(nodeID, endpoint, mfsServer string) *mfsDriver {
+func NewMFSdriver(nodeID, endpoint, mfsServer, mfsdir string) (*mfsDriver, error) {
 	vcam := []csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
@@ -39,5 +42,10 @@ func NewMFSdriver(nodeID, endpoint, mfsServer string) *mfsDriver {
 	for _, v := range vcam {
 		n.volcap[v] = true
 	}
-	return n
+	var err error
+	n.moosefsCLI, err = mfsexec.New(mfsdir, mfsServer)
+	if err != nil {
+		return nil, err
+	}
+	return n, nil
 }

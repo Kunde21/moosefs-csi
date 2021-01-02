@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"testing"
 
 	mfscsi "github.com/Kunde21/moosefs-csi"
 	mfs "github.com/Kunde21/moosefs-csi/driver"
+	"github.com/Kunde21/moosefs-csi/driver/mfsexec"
 	"k8s.io/utils/mount"
 
 	"github.com/kubernetes-csi/csi-test/v3/pkg/sanity"
@@ -39,7 +41,7 @@ func TestSanity(t *testing.T) {
 	})
 	nodeID, endpoint, server := "testing", ep, mfsEP
 	driver := mfs.NewMFSdriver(nodeID, endpoint, server)
-	m, err := mfs.NewMounter()
+	m, err := mfsexec.NewMounter()
 	if err != nil {
 		t.Error(err)
 	}
@@ -53,7 +55,7 @@ func TestSanity(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		if err := mfscsi.Serve(endpoint, ns, cs, ids); err != nil {
+		if err := mfscsi.Serve(context.Background(), endpoint, ns, cs, ids); err != nil {
 			t.Log(err)
 		}
 	}()
