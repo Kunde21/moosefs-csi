@@ -148,7 +148,7 @@ func (ns *NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 		Capabilities: []*csi.NodeServiceCapability{
 			{Type: &csi.NodeServiceCapability_Rpc{
 				Rpc: &csi.NodeServiceCapability_RPC{
-					Type: csi.NodeServiceCapability_RPC_UNKNOWN,
+					Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 				},
 			}},
 		},

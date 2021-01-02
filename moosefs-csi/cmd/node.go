@@ -32,6 +32,7 @@ import (
 
 	mfscsi "github.com/Kunde21/moosefs-csi"
 	mfs "github.com/Kunde21/moosefs-csi/driver"
+	"github.com/Kunde21/moosefs-csi/driver/mfsexec"
 )
 
 // nodeCmd represents the node command
@@ -48,8 +49,11 @@ func init() { rootCmd.AddCommand(nodeCmd) }
 
 // RunNode runs the node server
 func RunNode(cmd *cobra.Command, args []string) error {
-	driver := mfs.NewMFSdriver(csiArgs.nodeID, csiArgs.endpoint, csiArgs.server)
-	m, err := mfs.NewMounter()
+	driver, err := mfs.NewMFSdriver(csiArgs.nodeID, csiArgs.endpoint, csiArgs.server, csiArgs.mountDir)
+	if err != nil {
+		return err
+	}
+	m, err := mfsexec.NewMounter()
 	if err != nil {
 		return err
 	}

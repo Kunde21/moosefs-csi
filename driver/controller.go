@@ -10,11 +10,11 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Kunde21/moosefs-csi/driver/mfsexec"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	v1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -43,8 +43,16 @@ type ControllerServer struct {
 	mountDir string
 	root     string
 
+	mfscli moosefsCLI
+
 	stop chan struct{}
 	vols v1.PersistentVolumeInformer
+}
+
+type moosefsCLI interface {
+	SetQuota(context.Context, string, int64) error
+	GetQuota(context.Context, string) (int64, int64, error)
+	GetAvailableCap(context.Context) (int64, error)
 }
 
 func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer, error) {
@@ -67,8 +75,8 @@ func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer
 	if err := os.MkdirAll(mountDir, 0744); err != nil {
 		return nil, err
 	}
-
-	if err := m.Mount(path.Join(d.mfsServer+":", root), mountDir, "moosefs", nil); err != nil {
+	srv := path.Join(d.mfsServer+":", root)
+	if err := m.Mount(srv, mountDir, "moosefs", nil); err != nil {
 		return nil, fmt.Errorf("failed to mount root directory: %w", err)
 	}
 
@@ -80,19 +88,21 @@ func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer
 	if err != nil {
 		return nil, err
 	}
-	pv, err := k8cl.CoreV1().PersistentVolumes().Get("postgres-pv", metav1.GetOptions{})
-	if err != nil {
-		log.Println(err)
-	}
-	log.Println(pv)
-	core := informers.NewSharedInformerFactory(k8cl, 30*time.Second)
-	vols := core.Core().V1().PersistentVolumes()
+
+	inf := informers.NewSharedInformerFactory(k8cl, 10*time.Second)
+	vols := inf.Core().V1().PersistentVolumes()
 	stop := make(chan struct{}, 1)
 	go vols.Informer().Run(stop)
+	mfscli, err := mfsexec.New(mountDir, srv)
+	if err != nil {
+		return nil, err
+	}
 	return &ControllerServer{
 		d:        d,
 		mountDir: mountDir,
 		root:     root,
+
+		mfscli: mfscli,
 
 		stop: stop,
 		vols: vols,
@@ -142,7 +152,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      req.GetName(),
-			CapacityBytes: req.CapacityRange.GetRequiredBytes(),
+			CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
 			VolumeContext: vCtx,
 		},
 	}, nil
@@ -204,7 +214,7 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 		return nil, status.Error(codes.NotFound, "volume does not exist")
 	}
 	c := vk8.Spec.Capacity[corev1.ResourceStorage]
-	_, ok := c.AsInt64()
+	cap, ok := c.AsInt64()
 	if !ok {
 		return nil, status.Error(codes.Internal, "failed to get capacity")
 	}
@@ -226,6 +236,11 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 			return nil, status.Errorf(codes.Internal, "create directory failed: %v", err)
 		}
 	}
+
+	if err := cs.mfscli.SetQuota(ctx, md, cap); err != nil {
+		return nil, status.Errorf(codes.Internal, "set quota failed: %v", err)
+	}
+
 	return &csi.ControllerPublishVolumeResponse{}, nil
 }
 
@@ -273,8 +288,12 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-func (cs *ControllerServer) GetCapacity(_ context.Context, _ *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+func (cs *ControllerServer) GetCapacity(ctx context.Context, _ *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
+	cap, err := cs.mfscli.GetAvailableCap(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to read capacity %q", err)
+	}
+	return &csi.GetCapacityResponse{AvailableCapacity: cap}, nil
 }
 
 // ControllerGetCapabilities implements the default GRPC callout.
@@ -290,6 +309,16 @@ func (cs *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *
 			{Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+				},
+			}},
+			{Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+				},
+			}},
+			{Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 				},
 			}},
 		},
@@ -308,6 +337,25 @@ func (cs *ControllerServer) ListSnapshots(_ context.Context, _ *csi.ListSnapshot
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, _ *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	vol, err := cs.vols.Lister().Get(req.GetVolumeId())
+	if err != nil {
+		if k8serr.IsNotFound(err) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, err
+	}
+	sz := vol.Spec.Capacity["storage"]
+	cap := req.GetCapacityRange().GetRequiredBytes()
+	if s, _ := sz.AsInt64(); s > cap {
+		return nil, status.Error(codes.InvalidArgument, "resize must be larger than current size")
+	}
+	path := vol.Spec.CSI.VolumeAttributes[pk]
+	if vol.Spec.CSI.VolumeAttributes[rk] == "" {
+		return &csi.ControllerExpandVolumeResponse{CapacityBytes: cap}, nil
+	}
+	if err := cs.mfscli.SetQuota(ctx, path, cap); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &csi.ControllerExpandVolumeResponse{CapacityBytes: cap}, nil
 }

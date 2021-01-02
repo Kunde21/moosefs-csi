@@ -55,7 +55,10 @@ func init() {
 
 // RunController runs the controller server
 func RunController(cmd *cobra.Command, args []string) error {
-	driver := mfs.NewMFSdriver(csiArgs.nodeID, csiArgs.endpoint, csiArgs.server)
+	driver, err := mfs.NewMFSdriver(csiArgs.nodeID, csiArgs.endpoint, csiArgs.server, csiArgs.mountDir)
+	if err != nil {
+		return err
+	}
 	is, err := mfs.NewIdentityServer(driver)
 	if err != nil {
 		return err

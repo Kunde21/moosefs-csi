@@ -1,18 +1,16 @@
-package mfs
+package mfsexec
 
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 
 	"k8s.io/utils/mount"
 )
 
-var _ mount.Interface
+var _ mount.Interface = (*mounter)(nil)
 
 type mounter struct {
 	mount.Interface
@@ -29,54 +27,6 @@ func NewMounter() (mount.Interface, error) {
 		return nil, err
 	}
 	return &mounter{mount.New("")}, nil
-}
-
-// mount the mooseFs filesystem (possibly deprecated for k8s/mount)
-func (m *mounter) mount(sourcePath, destPath, mountType string, opts []string) error {
-	switch errMsg := "%s is not specified for mounting the volume"; "" {
-	case sourcePath:
-		return fmt.Errorf(errMsg, "source")
-	case destPath:
-		return fmt.Errorf(errMsg, "destination path")
-	}
-
-	mountCmd := "mount"
-	mountArgs := append(make([]string, 0, 6), "-t", mountType)
-	if len(opts) > 0 {
-		mountArgs = append(mountArgs, "-o", strings.Join(opts, ","))
-	}
-	mountArgs = append(mountArgs, sourcePath)
-	mountArgs = append(mountArgs, destPath)
-
-	// create target, os.Mkdirall is noop if it exists
-	err := os.MkdirAll(destPath, 0750)
-	if err != nil {
-		return err
-	}
-
-	out, err := exec.Command(mountCmd, mountArgs...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("mounting failed: %v cmd: '%s %s' output: %q",
-			err, mountCmd, strings.Join(mountArgs, " "), string(out))
-	}
-
-	return nil
-}
-
-// uMount (un-mount) the mooseFs filesystem (possibly deprecated for k8s/mount)
-func (m *mounter) uMount(destPath string) error {
-	umountCmd := "umount"
-	umountArgs := []string{}
-	if destPath == "" {
-		return errors.New("Destination path not specified for unmounting volume")
-	}
-	umountArgs = append(umountArgs, destPath)
-	out, err := exec.Command(umountCmd, umountArgs...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("mounting failed: %v cmd: '%s %s' output: %q",
-			err, umountCmd, strings.Join(umountArgs, " "), string(out))
-	}
-	return nil
 }
 
 // Checks if the given src and dst path are mounted
@@ -105,19 +55,6 @@ func (m *mounter) IsMounted(sourcePath, destPath string) (bool, error) {
 		}
 	}
 	return false, nil
-}
-
-func (m *mounter) isLikelyNotMountPoint(mountPoint string) (bool, error) {
-	switch errMsg := "%s is not specified for checking the mount"; "" {
-	case mountPoint:
-		return false, fmt.Errorf(errMsg, "path")
-	}
-
-	fsys, err := listMountsAtPoint(mountPoint)
-	if err != nil {
-		return false, err
-	}
-	return len(fsys) == 0, nil
 }
 
 type fileSystem struct {
