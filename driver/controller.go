@@ -8,22 +8,30 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/Kunde21/moosefs-csi/driver/metastore"
 	"github.com/Kunde21/moosefs-csi/driver/mfsexec"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
-	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/informers"
 	v1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/utils/mount"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+)
+
+const (
+	// Directory root for persistent volumes
+	volumePath = "volumes"
+	// Directory root for cluster metadata
+	metaPath = "k8smeta"
 )
 
 // Keys set within the volume context to hold volume details
@@ -43,10 +51,14 @@ type ControllerServer struct {
 	mountDir string
 	root     string
 
+	test bool
+
 	mfscli moosefsCLI
 
-	stop chan struct{}
-	vols v1.PersistentVolumeInformer
+	stop  chan struct{}
+	k8vs  v1.PersistentVolumeInformer
+	k8nds v1.NodeInformer
+	mfsvs *metastore.Store
 }
 
 type moosefsCLI interface {
@@ -55,7 +67,7 @@ type moosefsCLI interface {
 	GetAvailableCap(context.Context) (int64, error)
 }
 
-func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer, error) {
+func NewControllerServer(k8cl kubernetes.Interface, d *mfsDriver, root, mountDir string) (*ControllerServer, error) {
 	root, mountDir = path.Clean(root), path.Clean(mountDir)
 	if root == "" {
 		root = "/"
@@ -80,23 +92,21 @@ func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer
 		return nil, fmt.Errorf("failed to mount root directory: %w", err)
 	}
 
-	conf, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, err
-	}
-	k8cl, err := kubernetes.NewForConfig(conf)
-	if err != nil {
-		return nil, err
-	}
-
 	inf := informers.NewSharedInformerFactory(k8cl, 10*time.Second)
+	nodes := inf.Core().V1().Nodes()
 	vols := inf.Core().V1().PersistentVolumes()
 	stop := make(chan struct{}, 1)
 	go vols.Informer().Run(stop)
+	go nodes.Informer().Run(stop)
 	mfscli, err := mfsexec.New(mountDir, srv)
 	if err != nil {
 		return nil, err
 	}
+	md := filepath.Join(mountDir, metaPath)
+	if err := os.MkdirAll(md, 0744); err != nil {
+		return nil, err
+	}
+	mvols := metastore.New(md)
 	return &ControllerServer{
 		d:        d,
 		mountDir: mountDir,
@@ -104,8 +114,10 @@ func NewControllerServer(d *mfsDriver, root, mountDir string) (*ControllerServer
 
 		mfscli: mfscli,
 
-		stop: stop,
-		vols: vols,
+		stop:  stop,
+		k8vs:  vols,
+		k8nds: nodes,
+		mfsvs: mvols,
 	}, nil
 }
 
@@ -130,32 +142,74 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	case len(req.GetVolumeCapabilities()) == 0:
 		return nil, status.Error(codes.InvalidArgument, "capabilities not provided")
 	}
-	prms, vCtx := req.GetParameters(), map[string]string{}
+
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	pm, vCtx := req.GetParameters(), map[string]string{}
 	vCtx[sk] = cs.d.mfsServer
-	if prms[sk] != "" {
-		vCtx[sk] = prms[sk]
+	if pm[sk] != "" {
+		vCtx[sk] = pm[sk]
+	}
+	vol := metastore.Volume{
+		Name:     req.GetName(),
+		Capacity: req.GetCapacityRange().GetRequiredBytes(),
+		Dynamic:  true,
+		MFSPath:  cs.root,
 	}
 	// clear out any relative paths to protect cluster root
-	vCtx[pk] = filepath.Join("volumes", req.GetName())
+	vCtx[pk] = filepath.Join(volumePath, req.GetName())
 	vCtx[rk] = cs.root
-	if cp := path.Clean(prms[pk]); cp != "." {
+	if cp := path.Clean(pm[pk]); cp != "." {
 		if !path.IsAbs(cp) {
 			// relative paths can escape into the host filesystem
 			// join them to root to force an absolute path starting in mfs root directory
 			cp = path.Join("/", cp)
 		}
-		if prms[rk] == "true" {
+		if pm[rk] == "true" {
+			vol.MFSPath = ""
 			vCtx[rk] = ""
 		}
 		vCtx[pk] = cp
 	}
-	return &csi.CreateVolumeResponse{
-		Volume: &csi.Volume{
-			VolumeId:      req.GetName(),
-			CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
-			VolumeContext: vCtx,
-		},
-	}, nil
+	vol.MFSPath = filepath.Join(vCtx[rk], vCtx[pk])
+	if isSubDir(cs.root, vol.MFSPath) {
+		vol.Path = strings.TrimPrefix(vCtx[pk], cs.root)
+	}
+	csivol := &csi.Volume{
+		VolumeId:      req.GetName(),
+		CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
+		VolumeContext: vCtx,
+	}
+	v, err := cs.mfsvs.ReadVol(ctx, req.GetName())
+	if status.Code(err) == codes.OK {
+		switch {
+		case v.Capacity != vol.Capacity:
+			return nil, status.Error(codes.AlreadyExists, "capacity cannot be changed")
+		case v.MFSPath != vol.MFSPath:
+			return nil, status.Error(codes.AlreadyExists, "volume path cannot change")
+		}
+		return &csi.CreateVolumeResponse{Volume: csivol}, nil
+	}
+	if err := cs.mfsvs.CreateVol(ctx, vol); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &csi.CreateVolumeResponse{Volume: csivol}, nil
+}
+
+// mkDir creates the volume directory.
+func (cs *ControllerServer) mkDir(path string) error {
+	if !isSubDir(cs.mountDir, path) {
+		return nil
+	}
+	if ok, err := dirExist("/", path); err != nil {
+		return status.Errorf(codes.Internal, "directory exist failed: %v", err)
+	} else if ok {
+		return nil
+	}
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return status.Errorf(codes.Internal, "create directory failed: %v", err)
+	}
+	return nil
 }
 
 func dirExist(mount, path string) (bool, error) {
@@ -173,24 +227,32 @@ func dirExist(mount, path string) (bool, error) {
 	return true, status.Errorf(codes.FailedPrecondition, "path %q is not a directory", path)
 }
 
+func isSubDir(root, path string) bool {
+	dir := filepath.Dir(path)
+	for ; ; dir = filepath.Dir(dir) {
+		switch {
+		case root == dir:
+			return true
+		case len(dir) <= len(root):
+			return false
+		}
+	}
+}
+
 func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	switch "" {
 	case req.GetVolumeId():
 		return nil, status.Error(codes.InvalidArgument, "volume id not provided")
 	}
-	vk8, err := cs.vols.Lister().Get(req.GetVolumeId())
-	if err != nil {
-		if k8serr.IsNotFound(err) {
-			return &csi.DeleteVolumeResponse{}, nil
-		}
-		return nil, status.Error(codes.Internal, err.Error())
+	v, err := cs.mfsvs.ReadVol(ctx, req.GetVolumeId())
+	if status.Code(err) != codes.OK || v.Path == "" {
+		return &csi.DeleteVolumeResponse{}, nil
 	}
-	if vk8.Spec.CSI == nil || vk8.Spec.CSI.VolumeAttributes == nil {
-		return nil, status.Error(codes.InvalidArgument, "volume not provisioned by CSI driver")
-	}
-	params := vk8.Spec.CSI.VolumeAttributes
-	if err := os.RemoveAll(filepath.Join(cs.mountDir, params[pk])); err != nil {
+	if err := os.RemoveAll(filepath.Join(cs.mountDir, v.Path)); err != nil {
 		return nil, status.Errorf(codes.Internal, "remove directory failed: %v", err)
+	}
+	if err := cs.mfsvs.DeleteVol(ctx, v.Name); err != nil {
+		return nil, status.Errorf(codes.Internal, "remove volume failed: %v", err)
 	}
 	return &csi.DeleteVolumeResponse{}, nil
 }
@@ -208,46 +270,116 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability required")
 	}
-	vk8, err := cs.vols.Lister().Get(req.GetVolumeId())
-	if err != nil {
-		log.Println(err)
-		return nil, status.Error(codes.NotFound, "volume does not exist")
-	}
-	c := vk8.Spec.Capacity[corev1.ResourceStorage]
-	cap, ok := c.AsInt64()
-	if !ok {
-		return nil, status.Error(codes.Internal, "failed to get capacity")
-	}
 	vCtx := req.GetVolumeContext()
-	if vCtx[rk] == "" {
-		return &csi.ControllerPublishVolumeResponse{}, nil
+	v, err := cs.mfsvs.ReadVol(ctx, req.GetVolumeId())
+	switch status.Code(err) {
+	default:
+		return nil, status.Error(codes.Internal, err.Error())
+	case codes.NotFound:
+		// Pre-allocated volume
+		v = &metastore.Volume{
+			Name:    req.GetVolumeId(),
+			Dynamic: false,
+			MFSPath: filepath.Join(vCtx[rk], vCtx[pk]),
+		}
+		if isSubDir(cs.root, v.MFSPath) {
+			v.Path = strings.TrimPrefix(vCtx[pk], cs.root)
+		}
+		cap, err := cs.getVolumeCapacity(v.Name)
+		if err != nil {
+			return nil, err
+		}
+		v.Capacity = cap
+		if err := cs.mfsvs.CreateVol(ctx, *v); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	case codes.OK:
+		// Success
 	}
-	// Create directory if it does not exist.
-	// Missing directory will cause the mount to fail on the node.
-	ex, err := dirExist(cs.mountDir, vCtx[pk])
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("mountdir: %q, path: %q", cs.mountDir, vCtx[pk])
-	md := filepath.Join(cs.mountDir, vCtx[pk])
-	if !ex {
-		log.Printf("dirpath: %q", md)
-		if err := os.MkdirAll(md, 0755); err != nil {
-			return nil, status.Errorf(codes.Internal, "create directory failed: %v", err)
+	if v.Capacity == 0 {
+		// Set quota when missing
+		cap, err := cs.getVolumeCapacity(v.Name)
+		if err == nil {
+			v.Capacity = cap
+			if err := cs.mfsvs.UpdateVol(ctx, *v); err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
 		}
 	}
 
-	if err := cs.mfscli.SetQuota(ctx, md, cap); err != nil {
+	if _, err := cs.k8nds.Lister().Get(req.GetNodeId()); err != nil {
+		if k8serr.IsNotFound(err) {
+			return nil, status.Error(codes.NotFound, "node does not exist")
+		}
+	}
+	if v.Path == "" {
+		// Directory is outside of managed space.
+		v.Node = req.GetNodeId()
+		if err := cs.mfsvs.UpdateVol(ctx, *v); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		return &csi.ControllerPublishVolumeResponse{
+			PublishContext: map[string]string{"quota": strconv.FormatInt(v.Capacity, 10)},
+		}, nil
+	}
+	md := filepath.Join(cs.mountDir, v.Path)
+
+	// Create directory if it does not exist.
+	// Missing directory will cause the mount to fail on the node.
+	if err := cs.mkDir(md); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if v.Capacity == 0 {
+		return &csi.ControllerPublishVolumeResponse{}, nil
+	}
+	if err := cs.mfscli.SetQuota(ctx, md, v.Capacity); err != nil {
 		return nil, status.Errorf(codes.Internal, "set quota failed: %v", err)
 	}
 
+	v.Node = req.GetNodeId()
+	if err := cs.mfsvs.UpdateVol(ctx, *v); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
 	return &csi.ControllerPublishVolumeResponse{}, nil
+}
+
+// getVolumeCapacity as defined in k8s pv.
+func (cs *ControllerServer) getVolumeCapacity(id string) (int64, error) {
+	vk8, err := cs.k8vs.Lister().Get(id)
+	if err != nil {
+		log.Println(err)
+		return 0, status.Error(codes.NotFound, "k8s volume does not exist")
+	}
+	c := vk8.Spec.Capacity.Storage()
+	cap, ok := c.AsInt64()
+	if !ok {
+		return 0, status.Error(codes.Internal, "failed to get capacity")
+	}
+	return cap, nil
 }
 
 func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
 	switch "" {
 	case req.GetVolumeId():
 		return nil, status.Error(codes.InvalidArgument, "missing volume id")
+	}
+	v, err := cs.mfsvs.ReadVol(ctx, req.GetVolumeId())
+	switch status.Code(err) {
+	default:
+		return nil, status.Error(codes.Internal, err.Error())
+	case codes.NotFound:
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	case codes.OK:
+	}
+	if !v.Dynamic {
+		if err := cs.mfsvs.DeleteVol(ctx, req.GetVolumeId()); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+	v.Node = ""
+	if err := cs.mfsvs.UpdateVol(ctx, *v); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
@@ -257,16 +389,16 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 	case req.GetVolumeId():
 		return nil, status.Error(codes.InvalidArgument, "invalid request")
 	}
-	_, err := cs.vols.Lister().Get(req.GetVolumeId())
-	if status.Code(err) == codes.NotFound {
-		return nil, err
-	}
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	switch 0 {
-	case len(req.GetVolumeCapabilities()):
+	if len(req.GetVolumeCapabilities()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "invalid request")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, err := cs.mfsvs.ReadVol(ctx, req.GetVolumeId())
+	if status.Code(err) == codes.NotFound {
+		if _, err := cs.k8vs.Lister().Get(req.GetVolumeId()); status.Code(err) != codes.OK {
+			return nil, status.Error(codes.NotFound, "volume does not exist")
+		}
 	}
 	valid := true
 	for _, cap := range req.GetVolumeCapabilities() {
@@ -289,9 +421,11 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 }
 
 func (cs *ControllerServer) GetCapacity(ctx context.Context, _ *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	cap, err := cs.mfscli.GetAvailableCap(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to read capacity %q", err)
+		return nil, status.Errorf(codes.Internal, "failed to read capacity %v", err.Error())
 	}
 	return &csi.GetCapacityResponse{AvailableCapacity: cap}, nil
 }
@@ -338,24 +472,41 @@ func (cs *ControllerServer) ListSnapshots(_ context.Context, _ *csi.ListSnapshot
 }
 
 func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	vol, err := cs.vols.Lister().Get(req.GetVolumeId())
-	if err != nil {
-		if k8serr.IsNotFound(err) {
-			return nil, status.Error(codes.NotFound, err.Error())
-		}
+	switch "" {
+	case req.GetVolumeId():
+		return nil, status.Error(codes.InvalidArgument, "missing volume id")
+	}
+	v, err := cs.mfsvs.ReadVol(ctx, req.GetVolumeId())
+	if status.Code(err) == codes.NotFound {
 		return nil, err
 	}
-	sz := vol.Spec.Capacity["storage"]
-	cap := req.GetCapacityRange().GetRequiredBytes()
-	if s, _ := sz.AsInt64(); s > cap {
-		return nil, status.Error(codes.InvalidArgument, "resize must be larger than current size")
-	}
-	path := vol.Spec.CSI.VolumeAttributes[pk]
-	if vol.Spec.CSI.VolumeAttributes[rk] == "" {
-		return &csi.ControllerExpandVolumeResponse{CapacityBytes: cap}, nil
-	}
-	if err := cs.mfscli.SetQuota(ctx, path, cap); err != nil {
+	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	return &csi.ControllerExpandVolumeResponse{CapacityBytes: cap}, nil
+
+	cap := req.GetCapacityRange().GetRequiredBytes()
+	if v.Capacity > cap {
+		return &csi.ControllerExpandVolumeResponse{CapacityBytes: cap}, nil
+	}
+
+	// Update quota on managed paths only
+	dir := filepath.Join(cs.mountDir, v.Path)
+	ex, err := dirExist("/", dir)
+	if err != nil {
+		return nil, err
+	}
+	node := v.Path != "" && ex
+	if node {
+		if err := cs.mfscli.SetQuota(ctx, dir, cap); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
+	v.Capacity = cap
+	if err := cs.mfsvs.UpdateVol(ctx, *v); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &csi.ControllerExpandVolumeResponse{
+		CapacityBytes:         cap,
+		NodeExpansionRequired: !node,
+	}, nil
 }

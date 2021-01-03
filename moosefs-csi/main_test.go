@@ -8,6 +8,9 @@ import (
 	mfscsi "github.com/Kunde21/moosefs-csi"
 	mfs "github.com/Kunde21/moosefs-csi/driver"
 	"github.com/Kunde21/moosefs-csi/driver/mfsexec"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/mount"
 
 	"github.com/kubernetes-csi/csi-test/v3/pkg/sanity"
@@ -40,13 +43,21 @@ func TestSanity(t *testing.T) {
 		}
 	})
 	nodeID, endpoint, server := "testing", ep, mfsEP
-	driver := mfs.NewMFSdriver(nodeID, endpoint, server)
+	driver, err := mfs.NewMFSdriver(nodeID, endpoint, server, testdir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	m, err := mfsexec.NewMounter()
 	if err != nil {
 		t.Error(err)
 	}
 	ns := mfs.NewNodeServer(driver, m, root)
-	cs, err := mfs.NewControllerServer(driver, root, conDir)
+	k8scl := fake.NewSimpleClientset()
+	k8scl.CoreV1().Nodes().Create(context.Background(), &v1.Node{
+		TypeMeta:   metav1.TypeMeta{Kind: "Node", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "testing"},
+	}, metav1.CreateOptions{})
+	cs, err := mfs.NewControllerServer(k8scl, driver, root, conDir)
 	if err != nil {
 		t.Fatal(err)
 	}
