@@ -32,6 +32,9 @@ func New(dir, mfsServer string) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	if _, err := strconv.Atoi(port); err != nil {
+		port = "9421"
+	}
 	return &Runner{
 		mfsdir: dir,
 		host:   host,
@@ -47,9 +50,10 @@ func (r *Runner) exec(ctx context.Context, command string, args ...string) (out 
 
 // SetQuota for the volume at path, size in bytes.
 func (r *Runner) SetQuota(ctx context.Context, path string, size int64) error {
-	_, err := r.exec(ctx, "mfssetquota", "-l", strconv.FormatInt(size, 10), path)
+	args := []string{"-l", strconv.FormatInt(size, 10), path}
+	out, err := r.exec(ctx, "mfssetquota", args...)
 	if err != nil {
-		return err
+		return fmt.Errorf("args: %v  output: %v  err: %w", args, string(out), err)
 	}
 	// TODO: Debug log
 	return nil
@@ -97,10 +101,11 @@ func (r *Runner) GetAvailableCap(ctx context.Context) (int64, error) {
 	if r.port != "" {
 		args = append(args, "-P", r.port)
 	}
-	out, err := r.exec(ctx, "mfscli", append(args, "-SIN", "-s", sep)...)
+	args = append(args, "-SIN", "-s", sep)
+	out, err := r.exec(ctx, "mfscli", args...)
 	if err != nil {
 		fmt.Println(string(out))
-		return 0, err
+		return 0, fmt.Errorf("exec (%w) %q", err, out)
 	}
 	scan := bufio.NewScanner(bytes.NewBuffer(out))
 	for scan.Scan() {
@@ -113,5 +118,5 @@ func (r *Runner) GetAvailableCap(ctx context.Context) (int64, error) {
 			return strconv.ParseInt(string(bytes.TrimSpace(fld[2])), 10, 64)
 		}
 	}
-	return 0, fmt.Errorf("invalid mfscli output %q", string(out))
+	return 0, fmt.Errorf("invalid mfscli output %q", strings.Join(args, " "))
 }

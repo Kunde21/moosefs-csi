@@ -7,10 +7,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Kunde21/moosefs-csi/driver/mfsexec"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
 	"k8s.io/utils/mount"
@@ -86,7 +88,6 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if !filepath.IsAbs(srvPath) {
 		return nil, status.Errorf(codes.InvalidArgument, "volume path must be absolute %q", srvPath)
 	}
-
 	src := fmt.Sprintf("%s:%s", srv, srvPath)
 	mo := req.GetVolumeCapability().GetMount().GetMountFlags()
 	if req.GetReadonly() {
@@ -102,6 +103,18 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	default:
 		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	pCtx := req.GetPublishContext()
+	if pCtx == nil || pCtx["quota"] == "" {
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
+	cap, err := strconv.ParseInt(pCtx["quota"], 10, 64)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to parse quota: %v", err)
+	}
+	if _, err := ns.SetQuota(ctx, tgt, cap); err != nil {
+		return nil, err
 	}
 	return &csi.NodePublishVolumeResponse{}, nil
 }
@@ -151,12 +164,44 @@ func (ns *NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 					Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 				},
 			}},
+			{Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{
+					Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
+				},
+			}},
 		},
 	}, nil
 }
 
 func (ns *NodeServer) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	switch "" {
+	case in.GetVolumeId():
+		return nil, status.Error(codes.InvalidArgument, "volume id required")
+	case in.GetVolumePath():
+		return nil, status.Error(codes.InvalidArgument, "volume path required")
+	}
+	me, err := mfsexec.New(in.GetVolumePath(), ns.Driver.endpoint)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "failed to connect to mfs: %v", err)
+	}
+	use, tot, err := me.GetQuota(ctx, in.GetVolumePath())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get quota: %v", err)
+	}
+	avail := tot - use
+	if avail < 0 {
+		avail = 0
+	}
+	return &csi.NodeGetVolumeStatsResponse{
+		Usage: []*csi.VolumeUsage{
+			{
+				Available: avail,
+				Total:     tot,
+				Used:      use,
+				Unit:      csi.VolumeUsage_BYTES,
+			},
+		},
+	}, nil
 }
 
 func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
@@ -168,5 +213,35 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 }
 
 func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	switch "" {
+	case req.GetVolumeId():
+		return nil, status.Error(codes.InvalidArgument, "volume id required")
+	case req.GetVolumePath():
+		return nil, status.Error(codes.InvalidArgument, "volume path required")
+	}
+
+	dir := req.GetVolumePath()
+	cap, err := ns.SetQuota(ctx, dir, req.GetCapacityRange().GetRequiredBytes())
+	if err != nil {
+		return nil, err
+	}
+	return &csi.NodeExpandVolumeResponse{CapacityBytes: cap}, nil
+}
+
+func (ns *NodeServer) SetQuota(ctx context.Context, path string, size int64) (int64, error) {
+	me, err := mfsexec.New(path, ns.Driver.endpoint)
+	if err != nil {
+		return -1, status.Errorf(codes.NotFound, "failed to connect to mfs: %v", err)
+	}
+	_, tot, err := me.GetQuota(ctx, path)
+	if err != nil {
+		return -1, status.Errorf(codes.Internal, "failed to get quota: %v", err)
+	}
+	if tot >= size {
+		return size, nil
+	}
+	if err := me.SetQuota(ctx, path, size); err != nil {
+		return -1, status.Error(codes.Internal, err.Error())
+	}
+	return size, nil
 }

@@ -29,6 +29,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	mfscsi "github.com/Kunde21/moosefs-csi"
 	mfs "github.com/Kunde21/moosefs-csi/driver"
@@ -63,7 +65,17 @@ func RunController(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	cs, err := mfs.NewControllerServer(driver, csiArgs.root, csiArgs.mountDir)
+
+	conf, err := rest.InClusterConfig()
+	if err != nil {
+		return err
+	}
+	k8cl, err := kubernetes.NewForConfig(conf)
+	if err != nil {
+		return err
+	}
+
+	cs, err := mfs.NewControllerServer(k8cl, driver, csiArgs.root, csiArgs.mountDir)
 	if err != nil {
 		return err
 	}
