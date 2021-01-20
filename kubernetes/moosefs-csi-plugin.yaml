@@ -20,62 +20,6 @@ spec:
       priorityClassName: system-cluster-critical
       serviceAccount: csi-moosefs-plugin-controller
       containers:
-        # provisioner
-        - name: csi-provisioner
-          image: kunde21/k8s-provisioner:v1.5.0
-          args:
-            - "--provisioner=csi.kunde21.moosefs"
-            - "--csi-address=$(ADDRESS)"
-            - "--v=5"
-          env:
-            - name: ADDRESS
-              value: /var/lib/csi/sockets/pluginproxy/csi.sock
-          imagePullPolicy: "IfNotPresent"
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /var/lib/csi/sockets/pluginproxy/      
-        # attacher
-        - name: csi-attacher
-          image: kunde21/k8s-attacher:v2.1.0
-          args:
-            - "--v=5"
-            - "--csi-address=$(ADDRESS)"
-          env:
-            - name: ADDRESS
-              value: /var/lib/csi/sockets/pluginproxy/csi.sock
-          imagePullPolicy: "IfNotPresent"
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /var/lib/csi/sockets/pluginproxy/
-        # TODO: Integrate mfssnapshot functionality
-        # resizer
-        - name: csi-resizer
-          image: kunde21/k8s-resizer:v1.0.1
-          args:
-            - "--connection-timeout=15s"
-            - "--csi-address=$(ADDRESS)"
-            - "--handle-volume-inuse-error=false"
-          env:
-            - name: ADDRESS
-              value: /var/lib/csi/sockets/pluginproxy/csi.sock
-          imagePullPolicy: "IfNotPresent"
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /var/lib/csi/sockets/pluginproxy/
-        # TODO: Integrate mfssnapshot functionality
-        # snapshotter
-        # - name: csi-snapshotter
-        #   image: kunde21/csi-snapshotter:v1.0.1
-        #   args:
-        #     - "--connection-timeout=15s"
-        #     - "--csi-address=$(ADDRESS)"
-        #   env:
-        #     - name: ADDRESS
-        #       value: /var/lib/csi/sockets/pluginproxy/csi.sock
-        #   imagePullPolicy: "IfNotPresent"
-        #   volumeMounts:
-        #     - name: socket-dir
-        #       mountPath: /var/lib/csi/sockets/pluginproxy/
         # Moosefs Plugin
         - name: moosefs-csi-plugin
           securityContext:
@@ -83,12 +27,12 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: kunde21/moosefs-csi:v0.0.5
+          image: kunde21/moosefs-csi
           args :
             - "controller"
             - "--node=$(NODE_ID)"
             - "--endpoint=$(CSI_ENDPOINT)"
-            - "--server=$(MFS_SERVER)"           
+            - "--server=$(MFS_SERVER)"
             - "--root=$(MFS_ROOT_PATH)"
             - "--mount=$(MFS_ROOT_MOUNT_PATH)"
           envFrom:
@@ -103,7 +47,7 @@ spec:
               value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
             - name: MFS_ROOT_MOUNT_PATH
               value: /opt/mfs/kubernetes
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: Always
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
@@ -113,6 +57,61 @@ spec:
             - name: controller-mount-dir
               mountPath: /opt/mfs/kubernetes
               mountPropagation: "Bidirectional"
+        # provisioner
+        - name: csi-provisioner
+          image: kunde21/k8s-provisioner:v1.6.0
+          args:
+            - "--provisioner=csi.kunde21.moosefs"
+            - "--csi-address=$(ADDRESS)"
+            - "--v=5"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/      
+        # attacher
+        - name: csi-attacher
+          image: kunde21/k8s-attacher:v2.2.0
+          args:
+            - "--v=5"
+            - "--csi-address=$(ADDRESS)"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+        # resizer
+        - name: csi-resizer
+          image: kunde21/k8s-resizer:v1.1.0
+          args:
+            - "--timeout=15s"
+            - "--csi-address=$(ADDRESS)"
+            - "--handle-volume-inuse-error=false"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+        # TODO: Integrate mfssnapshot functionality
+        # snapshotter
+        # - name: csi-snapshotter
+        #   image: kunde21/csi-snapshotter:v4.0.0
+        #   args:
+        #     - "--connection-timeout=15s"
+        #     - "--csi-address=$(ADDRESS)"
+        #   env:
+        #     - name: ADDRESS
+        #       value: /var/lib/csi/sockets/pluginproxy/csi.sock
+        #   imagePullPolicy: "IfNotPresent"
+        #   volumeMounts:
+        #     - name: socket-dir
+        #       mountPath: /var/lib/csi/sockets/pluginproxy/
       volumes:
         - name: socket-dir
           emptyDir: {}
@@ -145,34 +144,13 @@ spec:
       serviceAccount: csi-moosefs-plugin-node
       hostNetwork: true
       containers:
-        - name: driver-registrar
-          image: kunde21/k8s-node-driver-registrar:v1.3.0
-          imagePullPolicy: "IfNotPresent"
-          args:
-            - "--v=5"
-            - "--csi-address=$(ADDRESS)"
-            - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
-          env:
-            - name: ADDRESS
-              value: /csi/csi.sock
-            - name: DRIVER_REG_SOCK_PATH
-              value: /var/lib/kubelet/plugins/csi.kunde21.moosefs/csi.sock              
-            - name: KUBE_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-          volumeMounts:
-            - name: plugin-dir
-              mountPath: /csi/
-            - name: registration-dir
-              mountPath: /registration/
         - name: csi-moosefs-plugin 
           securityContext:
             privileged: true
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: kunde21/moosefs-csi:v0.0.5
+          image: kunde21/moosefs-csi
           args :
             - "node"
             - "--node=$(NODE_ID)"
@@ -198,6 +176,27 @@ spec:
               mountPropagation: "Bidirectional"
             - mountPath: /dev
               name: device-dir
+        - name: driver-registrar
+          image: kunde21/k8s-node-driver-registrar:v1.3.0
+          imagePullPolicy: "IfNotPresent"
+          args:
+            - "--v=5"
+            - "--csi-address=$(ADDRESS)"
+            - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: DRIVER_REG_SOCK_PATH
+              value: /var/lib/kubelet/plugins/csi.kunde21.moosefs/csi.sock
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi/
+            - name: registration-dir
+              mountPath: /registration/
       volumes:
         - name: registration-dir
           hostPath:
