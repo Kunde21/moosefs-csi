@@ -18,5 +18,6 @@ metadata:
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
 provisioner: csi.kunde21.moosefs
+allowVolumeExpansion: true
 
 ...

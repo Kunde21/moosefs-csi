@@ -12,9 +12,9 @@ commonLabels:
   app.kubernetes.io/managed-by: kubectl-kustomize
 
 images:
-- name: MOOSEFS_PLUGIN_IMAGE
+- name: kunde21/moosefs-csi
   newName: kunde21/moosefs-csi
-  newTag: v3.0.112-v0.0.1
+  newTag: v3.0.115-v0.1.0
 
 generatorOptions:
   # Useful to create a static name for the configmap.
