@@ -29,4 +29,5 @@ require (
 	k8s.io/client-go v0.19.6
 	k8s.io/klog v1.0.0 // indirect
 	k8s.io/utils v0.0.0-20201110183641-67b214c5f920
+	github.com/hashicorp/nomad/api v0.0.0-20210430020956-28b8767b278f
 )

@@ -29,8 +29,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
 	mfscsi "github.com/Kunde21/moosefs-csi"
 	mfs "github.com/Kunde21/moosefs-csi/driver"
@@ -65,17 +63,25 @@ func RunController(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	conf, err := rest.InClusterConfig()
-	if err != nil {
-		return err
+	var orch mfs.Orchestration
+	switch csiArgs.orchestration {
+	case "k8s":
+		k8s, err := mfs.InitK8sIntegration()
+		if err != nil {
+			return err
+		}
+		orch = k8s
+	case "nomad":
+		nom, err := mfs.InitNomadIntegration()
+		if err != nil {
+			return err
+		}
+		orch = nom
+	default:
+		log.Fatalf("Could not recognize orchestration! Got %s", csiArgs.orchestration)
 	}
-	k8cl, err := kubernetes.NewForConfig(conf)
-	if err != nil {
-		return err
-	}
+	cs, err := mfs.NewControllerServer(orch, driver, csiArgs.root, csiArgs.mountDir)
 
-	cs, err := mfs.NewControllerServer(k8cl, driver, csiArgs.root, csiArgs.mountDir)
 	if err != nil {
 		return err
 	}

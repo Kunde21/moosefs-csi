@@ -16,10 +16,11 @@ import (
 	"github.com/Kunde21/moosefs-csi/driver/mfsexec"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
+	nomad "github.com/hashicorp/nomad/api"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/informers"
-	v1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/mount"
 
 	"google.golang.org/grpc"
@@ -51,14 +52,9 @@ type ControllerServer struct {
 	mountDir string
 	root     string
 
-	test bool
-
 	mfscli moosefsCLI
-
-	stop  chan struct{}
-	k8vs  v1.PersistentVolumeInformer
-	k8nds v1.NodeInformer
-	mfsvs *metastore.Store
+	orch   Orchestration
+	mfsvs  *metastore.Store
 }
 
 type moosefsCLI interface {
@@ -67,7 +63,60 @@ type moosefsCLI interface {
 	GetAvailableCap(context.Context) (int64, error)
 }
 
-func NewControllerServer(k8cl kubernetes.Interface, d *mfsDriver, root, mountDir string) (*ControllerServer, error) {
+type Orchestration interface {
+	VolumeExists(string) error
+	NodeExists(string) error
+	GetVolumeCapacity(string) (int64, error)
+}
+
+func InitK8sIntegration() (*k8sIntegration, error) {
+	conf, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	k8cl, err := kubernetes.NewForConfig(conf)
+	if err != nil {
+		return nil, err
+	}
+	inf := informers.NewSharedInformerFactory(k8cl, 10*time.Second)
+	nodes := inf.Core().V1().Nodes()
+	vols := inf.Core().V1().PersistentVolumes()
+	stop := make(chan struct{}, 1)
+	go vols.Informer().Run(stop)
+	go nodes.Informer().Run(stop)
+	return &k8sIntegration{
+		stop: stop,
+		vs:   vols,
+		nds:  nodes,
+	}, nil
+}
+
+func InitNomadIntegration() (*nomadIntegration, error) {
+	stop := make(chan struct{}, 1)
+	config := &nomad.Config{
+		Address:  os.Getenv("NOMAD_ADDR"),
+		SecretID: os.Getenv("NOMAD_TOKEN"),
+		TLSConfig: &nomad.TLSConfig{
+			CACert:     os.Getenv("NOMAD_CAPATH"),
+			ClientCert: os.Getenv("NOMAD_CLIENT_CERT"),
+			ClientKey:  os.Getenv("NOMAD_CLIENT_KEY"),
+		},
+	}
+
+	client, err := nomad.NewClient(config)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &nomadIntegration{
+		client: client,
+		stop:   stop,
+	}, nil
+}
+
+func NewControllerServer(orch Orchestration, d *mfsDriver, root, mountDir string) (*ControllerServer, error) {
+
 	root, mountDir = path.Clean(root), path.Clean(mountDir)
 	if root == "" {
 		root = "/"
@@ -92,12 +141,6 @@ func NewControllerServer(k8cl kubernetes.Interface, d *mfsDriver, root, mountDir
 		return nil, fmt.Errorf("failed to mount root directory: %w", err)
 	}
 
-	inf := informers.NewSharedInformerFactory(k8cl, 10*time.Second)
-	nodes := inf.Core().V1().Nodes()
-	vols := inf.Core().V1().PersistentVolumes()
-	stop := make(chan struct{}, 1)
-	go vols.Informer().Run(stop)
-	go nodes.Informer().Run(stop)
 	mfscli, err := mfsexec.New(mountDir, srv)
 	if err != nil {
 		return nil, err
@@ -113,11 +156,8 @@ func NewControllerServer(k8cl kubernetes.Interface, d *mfsDriver, root, mountDir
 		root:     root,
 
 		mfscli: mfscli,
-
-		stop:  stop,
-		k8vs:  vols,
-		k8nds: nodes,
-		mfsvs: mvols,
+		mfsvs:  mvols,
+		orch:   orch,
 	}, nil
 }
 
@@ -307,7 +347,7 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 		}
 	}
 
-	if _, err := cs.k8nds.Lister().Get(req.GetNodeId()); err != nil {
+	if err := cs.orch.NodeExists(req.GetNodeId()); err != nil {
 		if k8serr.IsNotFound(err) {
 			return nil, status.Error(codes.NotFound, "node does not exist")
 		}
@@ -345,17 +385,7 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 
 // getVolumeCapacity as defined in k8s pv.
 func (cs *ControllerServer) getVolumeCapacity(id string) (int64, error) {
-	vk8, err := cs.k8vs.Lister().Get(id)
-	if err != nil {
-		log.Println(err)
-		return 0, status.Error(codes.NotFound, "k8s volume does not exist")
-	}
-	c := vk8.Spec.Capacity.Storage()
-	cap, ok := c.AsInt64()
-	if !ok {
-		return 0, status.Error(codes.Internal, "failed to get capacity")
-	}
-	return cap, nil
+	return cs.orch.GetVolumeCapacity(id)
 }
 
 func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
@@ -396,7 +426,7 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 	defer cancel()
 	_, err := cs.mfsvs.ReadVol(ctx, req.GetVolumeId())
 	if status.Code(err) == codes.NotFound {
-		if _, err := cs.k8vs.Lister().Get(req.GetVolumeId()); status.Code(err) != codes.OK {
+		if err := cs.orch.VolumeExists(req.GetVolumeId()); status.Code(err) != codes.OK {
 			return nil, status.Error(codes.NotFound, "volume does not exist")
 		}
 	}

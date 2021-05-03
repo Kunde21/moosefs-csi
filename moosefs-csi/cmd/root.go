@@ -27,7 +27,7 @@ import (
 var (
 	cfgFile string
 	csiArgs struct {
-		endpoint, server, nodeID, root, mountDir string
+		orchestration, endpoint, server, nodeID, root, mountDir string
 	}
 )
 
@@ -69,6 +69,7 @@ func init() {
 	flag.StringVarP(&csiArgs.server, "server", "H", "mfsmaster", "moosefs master server")
 	flag.StringVarP(&csiArgs.nodeID, "node", "n", "", "node identifier")
 	flag.StringVarP(&csiArgs.root, "root", "r", "/", "filepath root on moosefs cluster")
+	flag.StringVarP(&csiArgs.orchestration, "orchestration", "o", "k8s", "Select used orchestration (default k8s)")
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.
