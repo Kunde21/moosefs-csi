@@ -16,6 +16,23 @@ import (
 	"github.com/kubernetes-csi/csi-test/v3/pkg/sanity"
 )
 
+type k8sFakeIntegration struct {
+	client *fake.Clientset
+}
+
+// Implement Orchestration interface
+func (k *k8sFakeIntegration) VolumeExists(id string) error {
+	return nil
+}
+
+func (k *k8sFakeIntegration) NodeExists(id string) error {
+	return nil
+}
+
+func (k *k8sFakeIntegration) GetVolumeCapacity(id string) (int64, error) {
+	return 100, nil
+}
+
 func TestSanity(t *testing.T) {
 	const testdir = "/tmp/csitesting"
 	const root = "/csitest"
@@ -51,13 +68,17 @@ func TestSanity(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+	var orch mfs.Orchestration
+
 	ns := mfs.NewNodeServer(driver, m, root)
 	k8scl := fake.NewSimpleClientset()
 	k8scl.CoreV1().Nodes().Create(context.Background(), &v1.Node{
 		TypeMeta:   metav1.TypeMeta{Kind: "Node", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{Name: "testing"},
 	}, metav1.CreateOptions{})
-	cs, err := mfs.NewControllerServer(k8scl, driver, root, conDir)
+	k8fake := &k8sFakeIntegration{client: k8scl}
+	orch = k8fake
+	cs, err := mfs.NewControllerServer(orch, driver, root, conDir)
 	if err != nil {
 		t.Fatal(err)
 	}
