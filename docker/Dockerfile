@@ -1,6 +1,6 @@
-ARG MOOSEFS_IMAGE
-ARG MOOSEFS_TAG
-FROM golang:1.15-alpine3.12 AS build-env
+ARG MOOSEFS_IMAGE=kunde21/moosefs
+ARG MOOSEFS_TAG=v3.0.116
+FROM golang:1.18.3-alpine3.16 AS build-env
 
 ARG MOOSEFS_VERSION=development
 ARG GOPROXY=https://proxy.golang.org
@@ -18,5 +18,7 @@ LABEL container_build="Chad Kunde <Kunde21@gmail.com>"
 LABEL description="MOOSEFS CSI plugin"
 
 COPY --from=build-env /moosefs-csi-plugin /bin/moosefs-csi-plugin
+
+RUN apk add moosefs --repository=http://dl-cdn.alpinelinux.org/alpine/edge/testing/
 
 ENTRYPOINT ["/bin/moosefs-csi-plugin"]
