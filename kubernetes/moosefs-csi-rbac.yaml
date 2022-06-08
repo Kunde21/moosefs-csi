@@ -65,6 +65,9 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch", "create", "update", "patch"]
@@ -76,7 +79,7 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["csi.storage.k8s.io"]
     resources: ["csidrivers"]
-    verbs:  ["get", "list", "create", "delete"]
+    verbs: ["get", "list", "create", "delete"]
 
 ---
 kind: ClusterRoleBinding

@@ -19,6 +19,7 @@ spec:
     spec:
       priorityClassName: system-cluster-critical
       serviceAccount: csi-moosefs-plugin-controller
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         # Moosefs Plugin
         - name: moosefs-csi-plugin
@@ -27,8 +28,8 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: kunde21/moosefs-csi
-          args :
+          image: kunde21/moosefs-csi:v3.0.116-v0.1.1
+          args:
             - "controller"
             - "--node=$(NODE_ID)"
             - "--endpoint=$(CSI_ENDPOINT)"
@@ -47,7 +48,7 @@ spec:
               value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
             - name: MFS_ROOT_MOUNT_PATH
               value: /opt/mfs/kubernetes
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
@@ -59,34 +60,34 @@ spec:
               mountPropagation: "Bidirectional"
         # provisioner
         - name: csi-provisioner
-          image: kunde21/k8s-provisioner:v1.6.0
+          image: k8s.gcr.io/sig-storage/csi-provisioner:v3.1.0
           args:
-            - "--provisioner=csi.kunde21.moosefs"
             - "--csi-address=$(ADDRESS)"
             - "--v=5"
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: socket-dir
-              mountPath: /var/lib/csi/sockets/pluginproxy/      
+              mountPath: /var/lib/csi/sockets/pluginproxy/
         # attacher
         - name: csi-attacher
-          image: kunde21/k8s-attacher:v2.2.0
+          image: k8s.gcr.io/sig-storage/csi-attacher:v3.4.0
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
+            - "--timeout=30s"
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         # resizer
         - name: csi-resizer
-          image: kunde21/k8s-resizer:v1.1.0
+          image: k8s.gcr.io/sig-storage/csi-resizer:v1.4.0
           args:
             - "--timeout=15s"
             - "--csi-address=$(ADDRESS)"
@@ -94,7 +95,7 @@ spec:
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
@@ -143,19 +144,20 @@ spec:
       priorityClassName: system-node-critical
       serviceAccount: csi-moosefs-plugin-node
       hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
-        - name: csi-moosefs-plugin 
+        - name: csi-moosefs-plugin
           securityContext:
             privileged: true
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: kunde21/moosefs-csi
-          args :
+          image: kunde21/moosefs-csi:v3.0.116-v0.1.1
+          args:
             - "node"
             - "--node=$(NODE_ID)"
             - "--endpoint=$(CSI_ENDPOINT)"
-            - "--server=$(MFS_SERVER)"           
+            - "--server=$(MFS_SERVER)"
             - "--root=$(MFS_ROOT_PATH)"
           envFrom:
             - configMapRef:
@@ -172,13 +174,13 @@ spec:
             - name: plugin-dir
               mountPath: /csi
             - name: pods-mount-dir
-              mountPath: /var/lib/kubelet
+              mountPath: /var/lib/kubelet/pods
               mountPropagation: "Bidirectional"
             - mountPath: /dev
               name: device-dir
         - name: driver-registrar
-          image: kunde21/k8s-node-driver-registrar:v1.3.0
-          imagePullPolicy: "IfNotPresent"
+          image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.5.0
+          imagePullPolicy: IfNotPresent
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
@@ -208,10 +210,8 @@ spec:
             type: DirectoryOrCreate
         - name: pods-mount-dir
           hostPath:
-            path: /var/lib/kubelet
+            path: /var/lib/kubelet/pods
             type: Directory
         - name: device-dir
           hostPath:
             path: /dev
-
-...
